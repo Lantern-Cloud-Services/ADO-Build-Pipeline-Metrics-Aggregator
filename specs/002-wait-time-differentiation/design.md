@@ -22,11 +22,25 @@ For every pipeline run, the following time buckets are defined:
 
 ### 1.2 The Identity Equation
 
+**For serial pipelines** (no parallel jobs/stages):
 ```
 wall_clock_duration = active_duration + wait_duration
-wait_duration ≥ approval_duration  (approval is a strict subset of wait)
+```
+
+**For parallel pipelines** (jobs executing concurrently):
+```
+active_duration ≥ wall_clock_duration   (sum of parallel job times exceeds wall-clock)
+wait_duration = 0                       (clamped; no idle time when parallelism fills the wall-clock)
+```
+
+**General invariant** (always holds):
+```
+wait_duration = max(0, wall_clock_duration − active_duration)
+wait_duration ≥ approval_duration       (approval is a strict subset of wait)
 total_elapsed = queue_duration + wall_clock_duration
 ```
+
+> **Note**: `active_duration` represents total agent-compute-seconds (sum of all job durations), which can exceed `wall_clock_duration` when jobs run in parallel. The identity `active + wait = wall_clock` holds only for serial pipelines. For parallel pipelines, `active_duration` exceeds `wall_clock_duration` and `wait_duration` is clamped to 0. This is by design: `active_duration` answers "how much agent time was consumed?" while `wait_duration` answers "how much wall-clock time was nobody working?"
 
 ### 1.3 Where Things Fall
 
@@ -333,7 +347,7 @@ When `--include-wait-times` is set (or `--jobs_output` is set):
 - `wait_duration = wall_clock - active_duration` — this could go NEGATIVE if jobs run in parallel.
 - **Solution**: Clamp `wait_duration` to `max(0, wall_clock - active_duration)`. When `active_duration > wall_clock`, it means parallel execution — there's no "waiting" but there IS parallelism.
 - **Alternative**: Redefine `active_duration` for the purpose of the identity as `min(Σjobs, wall_clock)`. But this loses the "total agent compute time" insight.
-- **Recommendation**: Report BOTH `active_duration` (agent-compute-seconds, can exceed wall clock) and `wait_duration` (clamped to ≥ 0). Add a note in docs that `active + wait = wall_clock` holds only for serial pipelines; for parallel pipelines, `active ≥ wall_clock` and `wait = 0`.
+- **Recommendation**: Report BOTH `active_duration` (agent-compute-seconds, can exceed wall clock) and `wait_duration` (clamped to ≥ 0). The identity `active + wait = wall_clock` holds only for serial pipelines; for parallel pipelines, `active > wall_clock` and `wait = 0`. See §1.2 for the precise invariant.
 
 ### 6.6 Timeline Unavailable (Purged or 404)
 
