@@ -6,6 +6,7 @@ A Python CLI tool that aggregates Azure DevOps pipeline (build) duration metrics
 
 - **Multi-organization support**: Process multiple Azure DevOps organizations in a single run
 - **Pipeline aggregation**: Generate per-pipeline statistics including run counts and duration metrics
+- **Wait/approval time differentiation** (opt-in): Break wall-clock duration into active execution time vs. wait/approval time so you can spot pipelines bottlenecked by manual approvals or idle gaps
 - **Job-level details**: Optional detailed job information with agent pool assignments
 - **Human-readable summaries**: Markdown reports with organization and project breakdowns
 - **CSV output**: Machine-readable data following documented schemas
@@ -76,6 +77,7 @@ python get-build-durations.py --org-url https://dev.azure.com/myorg --begin 2024
 | `--delay` | | Delay in ms between requests (default: 0) |
 | `--verbose` | | Enable verbose logging to stderr |
 | `--mock` | | Use deterministic mock data instead of live API (for testing) |
+| `--include-wait-breakdown` | | Fetch build timelines to differentiate wait/approval time from active execution time. Appends 7 columns to the pipeline CSV and adds a "Wait Time Analysis" section to the summary. Reuses timelines already fetched for `--jobs_output` (no extra API calls when both are set). |
 
 ## Output Files
 
@@ -90,8 +92,26 @@ Main aggregation file with one row per pipeline:
 | `pipeline_id` | integer | Pipeline identifier |
 | `pipeline_name` | string | Pipeline display name |
 | `run_count` | integer | Number of runs in date range |
-| `avg_duration_seconds` | integer | Average run duration |
-| `total_duration_seconds` | integer | Sum of all run durations |
+| `avg_duration_seconds` | integer | Average run duration (wall-clock, includes wait/approval time) |
+| `total_duration_seconds` | integer | Sum of all run durations (wall-clock, includes wait/approval time) |
+
+#### Wait/Approval Time Breakdown (opt-in)
+
+When `--include-wait-breakdown` is specified, 7 additional columns are appended (in this order) to differentiate wait/approval time from active execution time:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `wait_analyzed_run_count` | integer | Number of runs whose timeline was successfully analyzed (≤ `run_count`). Honestly reflects partial coverage when timeline fetches fail. |
+| `avg_active_seconds` | integer | Average active execution time per analyzed run (sum of Job-record intervals, with overlapping parallel jobs unioned, not double-counted). |
+| `total_active_seconds` | integer | Sum of active execution time across analyzed runs. |
+| `avg_wait_seconds` | integer | Average wait/idle time per analyzed run. Includes manual approval gates, environment checks, and any other gaps where no Job was running. |
+| `total_wait_seconds` | integer | Sum of wait/idle time across analyzed runs. |
+| `avg_approval_seconds` | integer | Average time per analyzed run spent specifically in approval/checkpoint records (a *subset* of wait time). |
+| `total_approval_seconds` | integer | Sum of approval time across analyzed runs. |
+
+Identity per analyzed run: `active_seconds + wait_seconds == total_duration_seconds` (modulo integer rounding) and `approval_seconds <= wait_seconds <= total_duration_seconds`.
+
+The base 8-column schema is unchanged when `--include-wait-breakdown` is not set, so existing CSV consumers continue to work without modification.
 
 ### Jobs CSV (`jobs.csv`) - Optional
 Detailed job information when `--jobs_output` specified:
@@ -113,6 +133,7 @@ Human-readable report including:
 - **Overview**: Total organizations, projects, pipelines, runs
 - **By Organization**: Aggregates per organization
 - **By Project**: Aggregates per project within each organization
+- **Wait Time Analysis** (only when `--include-wait-breakdown` is set and at least one run was analyzed): Per-section wait/approval bullets plus a "Top Pipelines by Wait %" table sorted descending by `total_wait_seconds / total_duration_seconds`, surfacing pipelines most bottlenecked by approvals or idle time.
 
 ## Authentication
 
@@ -202,6 +223,25 @@ python get-build-durations.py `
   --delay 100 `
   --verbose
 ```
+
+### Example 4: Wait/Approval Time Breakdown
+```powershell
+# Differentiate wall-clock time into active execution vs. wait/approval time.
+# Adds 7 columns to the CSV and a "Wait Time Analysis" / "Top Pipelines by Wait %"
+# section to the summary so you can spot pipelines bottlenecked by manual approvals.
+$env:AZDO_PAT = "your_pat_token"
+python get-build-durations.py `
+  --org-url https://dev.azure.com/contoso `
+  --begin 2024-01-01 `
+  --end 2024-02-01 `
+  --output pipelines.csv `
+  --include-wait-breakdown
+```
+
+> Note: `--include-wait-breakdown` fetches the timeline for every build (1 extra
+> API call per build). When `--jobs_output` is also set, the same timeline is
+> reused, so combining the two flags adds no extra API calls beyond what
+> `--jobs_output` already requires.
 
 ## Error Handling
 

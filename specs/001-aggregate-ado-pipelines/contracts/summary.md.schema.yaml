@@ -40,7 +40,31 @@ sections:
         type: integer
       - key: total_duration_seconds
         type: integer
-        
+  - name: Wait Time Analysis
+    condition: "--include-wait-breakdown is set AND any pipeline has wait_analyzed_run_count > 0"
+    fields:
+      - key: top_pipelines_by_wait_pct
+        type: table
+        columns:
+          - pipeline_name
+          - project_name
+          - org_url
+          - runs_analyzed
+          - wait_pct
+          - avg_wait_seconds
+          - avg_approval_seconds
+
+conditional_fields:
+  trigger: "--include-wait-breakdown"
+  description: >
+    When the flag is set, each of the Overview / By Organization / By Project
+    sections additionally includes wait_analyzed_run_count, total_active_seconds,
+    total_wait_seconds, total_approval_seconds, avg_wait_seconds, and a derived
+    wait_percentage (total_wait_seconds / total_duration_seconds).
+
 notes:
   - Summary file defaults to `<output>.summary.md` when `--output` is provided.
   - Otherwise require `--summary_output` flag.
+  - The "Wait Time Analysis" section and per-section wait fields are only
+    emitted when --include-wait-breakdown is set and at least one row in scope
+    has wait_analyzed_run_count > 0.
