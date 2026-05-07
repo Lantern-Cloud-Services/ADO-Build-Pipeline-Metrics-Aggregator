@@ -18,6 +18,29 @@ columns:
     type: integer
   - name: total_duration_seconds
     type: integer
+  - name: total_wait_seconds
+    type: integer
+    description: >-
+      Sum of approval / idle wait time across all runs (seconds). Computed
+      from each build's timeline by summing Checkpoint.Approval and
+      ManualIntervention record durations. Reported as 0 unless the
+      --include-wait-time flag is enabled.
+  - name: avg_wait_seconds
+    type: integer
+    description: Average approval / idle wait time per run (seconds).
+  - name: total_active_seconds
+    type: integer
+    description: >-
+      total_duration_seconds minus total_wait_seconds. Represents wall-clock
+      time spent actively executing rather than waiting on approvals.
+  - name: avg_active_seconds
+    type: integer
+    description: Average active (non-waiting) duration per run (seconds).
 notes:
   - Deterministic column order; stable across versions.
   - Values computed from mocked runs within [begin, end) window.
+  - >-
+    Wait/active columns are populated only when --include-wait-time is passed
+    to the CLI (which incurs one additional timeline API call per build).
+    Without the flag they are reported as 0 to keep the column set stable.
+

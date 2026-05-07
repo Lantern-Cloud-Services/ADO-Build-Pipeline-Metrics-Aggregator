@@ -6,6 +6,7 @@ A Python CLI tool that aggregates Azure DevOps pipeline (build) duration metrics
 
 - **Multi-organization support**: Process multiple Azure DevOps organizations in a single run
 - **Pipeline aggregation**: Generate per-pipeline statistics including run counts and duration metrics
+- **Idle / approval wait differentiation**: Optional `--include-wait-time` flag separates time the pipeline spent waiting on approval/checkpoint gates from active build time
 - **Job-level details**: Optional detailed job information with agent pool assignments
 - **Human-readable summaries**: Markdown reports with organization and project breakdowns
 - **CSV output**: Machine-readable data following documented schemas
@@ -76,6 +77,7 @@ python get-build-durations.py --org-url https://dev.azure.com/myorg --begin 2024
 | `--delay` | | Delay in ms between requests (default: 0) |
 | `--verbose` | | Enable verbose logging to stderr |
 | `--mock` | | Use deterministic mock data instead of live API (for testing) |
+| `--include-wait-time` | | Compute approval/idle wait time per build by fetching its timeline. Populates the `*_wait_seconds` and `*_active_seconds` columns. Adds 1 extra API call per build, so opt-in. |
 
 ## Output Files
 
@@ -90,8 +92,12 @@ Main aggregation file with one row per pipeline:
 | `pipeline_id` | integer | Pipeline identifier |
 | `pipeline_name` | string | Pipeline display name |
 | `run_count` | integer | Number of runs in date range |
-| `avg_duration_seconds` | integer | Average run duration |
-| `total_duration_seconds` | integer | Sum of all run durations |
+| `avg_duration_seconds` | integer | Average run duration (wall-clock, includes approval waits) |
+| `total_duration_seconds` | integer | Sum of all run durations (wall-clock, includes approval waits) |
+| `total_wait_seconds` | integer | Sum of approval / idle wait time across all runs (`Checkpoint.Approval` + `ManualIntervention` records). `0` unless `--include-wait-time` is used. |
+| `avg_wait_seconds` | integer | Average approval / idle wait time per run. `0` unless `--include-wait-time` is used. |
+| `total_active_seconds` | integer | `total_duration_seconds − total_wait_seconds` (active execution time). Equals `total_duration_seconds` unless `--include-wait-time` is used. |
+| `avg_active_seconds` | integer | Average active (non-waiting) duration per run. Equals `avg_duration_seconds` unless `--include-wait-time` is used. |
 
 ### Jobs CSV (`jobs.csv`) - Optional
 Detailed job information when `--jobs_output` specified:
@@ -202,6 +208,27 @@ python get-build-durations.py `
   --delay 100 `
   --verbose
 ```
+
+### Example 4: Differentiating Approval / Wait Time
+```powershell
+# Compute approval/idle wait time per build by inspecting the build timeline.
+# Populates total_wait_seconds, avg_wait_seconds, total_active_seconds, and
+# avg_active_seconds in the CSV. NOTE: this adds one extra API call per
+# build, so consider pairing with --delay against large orgs.
+python get-build-durations.py `
+  --org-url https://dev.azure.com/contoso `
+  --begin 2024-01-01 `
+  --end 2024-02-01 `
+  --output pipelines.csv `
+  --include-wait-time `
+  --verbose
+```
+
+When the `--include-wait-time` flag is omitted (the default), the new wait /
+active columns are still emitted but populated with `0`, preserving the
+existing CSV column order and the historical meaning of
+`total_duration_seconds` (wall-clock time from build start to finish,
+including any approval pauses).
 
 ## Error Handling
 

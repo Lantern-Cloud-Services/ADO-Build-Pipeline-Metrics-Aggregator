@@ -127,7 +127,14 @@ def generate_mock_pipelines(project_name: str, seed: int) -> List[Dict[str, Any]
     return pipelines
 
 def generate_mock_runs(pipeline: Dict[str, Any], begin_dt: dt.datetime, end_dt: dt.datetime, seed: int) -> List[Dict[str, Any]]:
-    """Generate deterministic mock pipeline runs within date range."""
+    """Generate deterministic mock pipeline runs within date range.
+
+    A subset of runs (~25%) include a deterministic ``mock_wait_seconds``
+    field representing approval/checkpoint wait time embedded within the
+    run's wall-clock duration. When the ``--include-wait-time`` flag is
+    enabled this value is reported as wait time; otherwise it is ignored,
+    keeping existing mock CSV output byte-identical to prior versions.
+    """
     pipeline_id = pipeline['id']
     rng = random.Random(seed + pipeline_id)
     
@@ -151,7 +158,21 @@ def generate_mock_runs(pipeline: Dict[str, Any], begin_dt: dt.datetime, end_dt: 
         
         # Status
         status = rng.choices(['succeeded', 'failed', 'canceled'], weights=[85, 12, 3])[0]
-        
+
+        # Approval/idle wait simulation: ~25% of runs have an approval gap
+        # embedded within their wall-clock duration. The wait is bounded
+        # by the run's own duration to stay self-consistent.
+        # Use an INDEPENDENT per-run RNG so adding this feature does not
+        # shift the existing rng state and break golden mock outputs.
+        # 100003 is just a large prime used to spread per-pipeline seeds
+        # across distinct streams; the exact value is not significant.
+        wait_rng = random.Random(seed + pipeline_id * 100003 + i + 1)
+        if wait_rng.random() < 0.25:
+            max_wait = max(0.0, duration_minutes * 60.0 - 30.0)
+            mock_wait_seconds = wait_rng.uniform(30.0, min(600.0, max_wait)) if max_wait > 30.0 else 0.0
+        else:
+            mock_wait_seconds = 0.0
+
         run_id = 10000 + (pipeline_id * 100) + i
         runs.append({
             "id": run_id,
@@ -161,6 +182,7 @@ def generate_mock_runs(pipeline: Dict[str, Any], begin_dt: dt.datetime, end_dt: 
             "startTime": start_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
             "finishTime": finish_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
             "result": status,
+            "mock_wait_seconds": mock_wait_seconds,
             "queue": {
                 "pool": {
                     "id": rng.randint(1, 5),
@@ -290,6 +312,20 @@ def parse_args() -> argparse.Namespace:
         "--mock",
         action="store_true",
         help="Use deterministic mock data instead of live Azure DevOps API (for testing)",
+    )
+
+    parser.add_argument(
+        "--include-wait-time",
+        action="store_true",
+        help=(
+            "Compute approval/idle wait time for each build by fetching its "
+            "timeline and inspecting Checkpoint.Approval / ManualIntervention "
+            "records. Populates the wait/active duration columns in the "
+            "pipeline CSV. Adds one extra API call per build, so this is "
+            "opt-in. When omitted, wait/active columns are reported as 0 and "
+            "total_duration_seconds retains its existing meaning (wall-clock "
+            "from build start to finish, including approval pauses)."
+        ),
     )
 
     return parser.parse_args()
@@ -446,6 +482,44 @@ def parse_duration_seconds(start_time: str, finish_time: str) -> float:
     start = parse_ado_timestamp(start_time)
     finish = parse_ado_timestamp(finish_time)
     return (finish - start).total_seconds()
+
+
+# Timeline record types that represent the build being idle / waiting for
+# something other than active execution. Approval checkpoints and manual
+# intervention tasks pause the build between stages and inflate the
+# wall-clock duration without consuming active build time.
+_WAIT_RECORD_TYPES = {"Checkpoint.Approval", "ManualIntervention"}
+
+
+def extract_wait_seconds_from_timeline(timeline: Dict[str, Any]) -> float:
+    """
+    Compute the total approval/idle wait time (seconds) for a build from
+    its timeline.
+
+    Sums the (finishTime - startTime) of timeline records that represent
+    the build being paused waiting on a human or external signal:
+      - Checkpoint.Approval records (manual approval gates between stages)
+      - ManualIntervention task records (mid-pipeline manual steps)
+
+    Note: We intentionally do NOT include the parent "Checkpoint" record
+    type because Checkpoint records are containers whose duration covers
+    their child Checkpoint.Approval records; including both would
+    double-count.
+
+    Returns 0.0 when timeline is empty/None or contains no wait records.
+    Overlapping approvals (e.g. parallel stages) are summed, which gives
+    the cumulative human-wait cost rather than wall-clock idle time.
+    """
+    if not timeline:
+        return 0.0
+    total = 0.0
+    for rec in timeline.get("records", []) or []:
+        rtype = rec.get("type")
+        if rtype in _WAIT_RECORD_TYPES:
+            total += parse_duration_seconds(
+                rec.get("startTime"), rec.get("finishTime")
+            )
+    return total
 
 
 def get_build_timeline(
@@ -687,29 +761,58 @@ def aggregate_pipelines_new_format(
     org_url: str,
     project_id: str,
     project_name: str,
-    runs_by_pipeline: Dict[int, List[Dict[str, Any]]]
+    runs_by_pipeline: Dict[int, List[Dict[str, Any]]],
+    wait_seconds_by_build_id: Dict[Any, float] = None,
 ) -> List[Dict[str, Any]]:
-    """Aggregate pipeline runs into new CSV format following pipeline_aggregate.csv.schema.yaml"""
+    """Aggregate pipeline runs into new CSV format following pipeline_aggregate.csv.schema.yaml
+
+    When `wait_seconds_by_build_id` is provided, each run's idle/approval
+    wait time (looked up by build id) is subtracted from total duration
+    to compute "active" duration. When not provided (default), wait
+    metrics are reported as 0 and active duration equals total duration,
+    preserving backward-compatible behavior.
+    """
     results = []
-    
+    wait_lookup = wait_seconds_by_build_id or {}
+
     for pipeline_id, runs in runs_by_pipeline.items():
         if not runs:
             continue
-            
+
         pipeline_name = runs[0].get('definition', {}).get('name', f'Pipeline-{pipeline_id}')
-        
+
         total_duration_seconds = 0
+        total_wait_seconds = 0.0
         run_count = len(runs)
-        
+
         for run in runs:
             duration = parse_duration_seconds(
-                run.get('startTime'), 
+                run.get('startTime'),
                 run.get('finishTime')
             )
             total_duration_seconds += duration
-        
+
+            wait = wait_lookup.get(run.get('id'), 0.0)
+            # Defensive clamping: the live timeline shouldn't normally
+            # report wait > active build duration, but timeline records
+            # can have missing/inconsistent timestamps, clock skew, or
+            # pending approvals on in-progress builds. Clamp to [0, duration]
+            # so reported active time is never negative.
+            if wait < 0:
+                wait = 0.0
+            if wait > duration:
+                wait = duration
+            total_wait_seconds += wait
+
         avg_duration_seconds = int(total_duration_seconds / run_count) if run_count > 0 else 0
-        
+        # Compute integer versions first so the reported active = duration - wait
+        # holds exactly in integer arithmetic for downstream consumers.
+        total_duration_int = int(total_duration_seconds)
+        total_wait_int = int(total_wait_seconds)
+        total_active_int = total_duration_int - total_wait_int
+        avg_wait_seconds = total_wait_int // run_count if run_count > 0 else 0
+        avg_active_seconds = total_active_int // run_count if run_count > 0 else 0
+
         results.append({
             'org_url': org_url,
             'project_id': project_id,
@@ -718,9 +821,13 @@ def aggregate_pipelines_new_format(
             'pipeline_name': pipeline_name,
             'run_count': run_count,
             'avg_duration_seconds': avg_duration_seconds,
-            'total_duration_seconds': int(total_duration_seconds)
+            'total_duration_seconds': total_duration_int,
+            'total_wait_seconds': total_wait_int,
+            'avg_wait_seconds': avg_wait_seconds,
+            'total_active_seconds': total_active_int,
+            'avg_active_seconds': avg_active_seconds,
         })
-    
+
     return results
 
 def write_pipeline_csv(file_handle: Any, pipeline_rows: List[Dict[str, Any]]) -> None:
@@ -733,7 +840,11 @@ def write_pipeline_csv(file_handle: Any, pipeline_rows: List[Dict[str, Any]]) ->
         'pipeline_name',
         'run_count',
         'avg_duration_seconds',
-        'total_duration_seconds'
+        'total_duration_seconds',
+        'total_wait_seconds',
+        'avg_wait_seconds',
+        'total_active_seconds',
+        'avg_active_seconds',
     ]
     
     writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
@@ -778,7 +889,18 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
     total_runs = sum(row['run_count'] for row in pipeline_rows)
     total_duration_seconds = sum(row['total_duration_seconds'] for row in pipeline_rows)
     avg_duration_seconds = int(total_duration_seconds / total_runs) if total_runs > 0 else 0
-    
+    total_wait_seconds = sum(row.get('total_wait_seconds', 0) for row in pipeline_rows)
+    total_active_seconds = sum(row.get('total_active_seconds', 0) for row in pipeline_rows)
+    avg_wait_seconds = int(total_wait_seconds / total_runs) if total_runs > 0 else 0
+    avg_active_seconds = int(total_active_seconds / total_runs) if total_runs > 0 else 0
+    # Surface wait/active sections in the summary only when at least one
+    # build reported approval/idle time. This intentionally doubles as the
+    # "is the --include-wait-time flag effective?" signal: when the flag is
+    # off, every per-pipeline total is 0 and these sections are omitted; when
+    # the flag is on but no builds had approvals, there's no meaningful
+    # delta between active and total duration to display.
+    has_wait_data = total_wait_seconds > 0
+
     org_count = len(set(row['org_url'] for row in pipeline_rows))
     project_count = len(set(f"{row['org_url']}|{row['project_id']}" for row in pipeline_rows))
     pipeline_count = len(pipeline_rows)
@@ -792,10 +914,15 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
         project_key = f"{row['org_url']}|{row['project_id']}"
         
         if org_url not in by_org:
-            by_org[org_url] = {'pipelines': [], 'total_runs': 0, 'total_duration': 0}
+            by_org[org_url] = {
+                'pipelines': [], 'total_runs': 0, 'total_duration': 0,
+                'total_wait': 0, 'total_active': 0,
+            }
         by_org[org_url]['pipelines'].append(row)
         by_org[org_url]['total_runs'] += row['run_count']
         by_org[org_url]['total_duration'] += row['total_duration_seconds']
+        by_org[org_url]['total_wait'] += row.get('total_wait_seconds', 0)
+        by_org[org_url]['total_active'] += row.get('total_active_seconds', 0)
         
         if project_key not in by_project:
             by_project[project_key] = {
@@ -803,11 +930,15 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
                 'org_url': row['org_url'],
                 'pipelines': [],
                 'total_runs': 0,
-                'total_duration': 0
+                'total_duration': 0,
+                'total_wait': 0,
+                'total_active': 0,
             }
         by_project[project_key]['pipelines'].append(row)
         by_project[project_key]['total_runs'] += row['run_count']
         by_project[project_key]['total_duration'] += row['total_duration_seconds']
+        by_project[project_key]['total_wait'] += row.get('total_wait_seconds', 0)
+        by_project[project_key]['total_active'] += row.get('total_active_seconds', 0)
     
     # Write markdown
     with open(file_path, 'w', encoding='utf-8') as f:
@@ -820,7 +951,14 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
         f.write(f"- **Pipelines**: {pipeline_count}\n")
         f.write(f"- **Total Runs**: {total_runs}\n")
         f.write(f"- **Total Duration**: {total_duration_seconds:,} seconds ({seconds_to_hms(total_duration_seconds)})\n")
-        f.write(f"- **Average Duration**: {avg_duration_seconds} seconds ({seconds_to_hms(avg_duration_seconds)})\n\n")
+        f.write(f"- **Average Duration**: {avg_duration_seconds} seconds ({seconds_to_hms(avg_duration_seconds)})\n")
+        if has_wait_data:
+            wait_pct = (total_wait_seconds / total_duration_seconds * 100) if total_duration_seconds > 0 else 0
+            f.write(f"- **Total Active Duration**: {total_active_seconds:,} seconds ({seconds_to_hms(total_active_seconds)})\n")
+            f.write(f"- **Average Active Duration**: {avg_active_seconds} seconds ({seconds_to_hms(avg_active_seconds)})\n")
+            f.write(f"- **Total Approval/Wait Time**: {total_wait_seconds:,} seconds ({seconds_to_hms(total_wait_seconds)}) — {wait_pct:.1f}% of total\n")
+            f.write(f"- **Average Approval/Wait Time**: {avg_wait_seconds} seconds ({seconds_to_hms(avg_wait_seconds)})\n")
+        f.write("\n")
         
         # By Organization section
         f.write("## By Organization\n\n")
@@ -832,7 +970,11 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
             f.write(f"- **Pipelines**: {org_pipeline_count}\n")
             f.write(f"- **Total Runs**: {data['total_runs']}\n")
             f.write(f"- **Total Duration**: {data['total_duration']:,} seconds ({seconds_to_hms(data['total_duration'])})\n")
-            f.write(f"- **Average Duration**: {org_avg_duration} seconds ({seconds_to_hms(org_avg_duration)})\n\n")
+            f.write(f"- **Average Duration**: {org_avg_duration} seconds ({seconds_to_hms(org_avg_duration)})\n")
+            if has_wait_data:
+                f.write(f"- **Total Active Duration**: {data['total_active']:,} seconds ({seconds_to_hms(data['total_active'])})\n")
+                f.write(f"- **Total Approval/Wait Time**: {data['total_wait']:,} seconds ({seconds_to_hms(data['total_wait'])})\n")
+            f.write("\n")
         
         # By Project section  
         f.write("## By Project\n\n")
@@ -843,7 +985,11 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
             f.write(f"### {data['project_name']} ({data['org_url']})\n\n")
             f.write(f"- **Pipelines**: {project_pipeline_count}\n")
             f.write(f"- **Total Runs**: {data['total_runs']}\n")
-            f.write(f"- **Total Duration**: {data['total_duration']:,} seconds ({seconds_to_hms(data['total_duration'])})\n\n")
+            f.write(f"- **Total Duration**: {data['total_duration']:,} seconds ({seconds_to_hms(data['total_duration'])})\n")
+            if has_wait_data:
+                f.write(f"- **Total Active Duration**: {data['total_active']:,} seconds ({seconds_to_hms(data['total_active'])})\n")
+                f.write(f"- **Total Approval/Wait Time**: {data['total_wait']:,} seconds ({seconds_to_hms(data['total_wait'])})\n")
+            f.write("\n")
 
 def aggregate_builds_for_project(
     project_name: str,
@@ -929,6 +1075,7 @@ def process_project_live(
     max_finish_time: str,
     delay_ms: int,
     emit_jobs: bool,
+    include_wait_time: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Process a project using live Azure DevOps API calls"""
     project_name = proj["name"]
@@ -952,25 +1099,62 @@ def process_project_live(
                 if pipeline_id not in runs_by_pipeline:
                     runs_by_pipeline[pipeline_id] = []
                 runs_by_pipeline[pipeline_id].append(build)
-        
+
+        # When wait-time and/or job extraction is requested we need each
+        # build's timeline. Fetch each timeline at most once and reuse it
+        # for both purposes to avoid duplicate API calls.
+        timelines_by_build_id: Dict[Any, Dict[str, Any]] = {}
+        wait_seconds_by_build_id: Dict[Any, float] = {}
+        if emit_jobs or include_wait_time:
+            for build in builds:
+                build_id = build.get("id")
+                if build_id is None:
+                    continue
+                try:
+                    timeline = get_build_timeline(
+                        org_url, project_name, build_id, auth, delay_ms
+                    )
+                    timelines_by_build_id[build_id] = timeline
+                    if include_wait_time:
+                        wait_seconds_by_build_id[build_id] = (
+                            extract_wait_seconds_from_timeline(timeline)
+                        )
+                except Exception as e:
+                    if VERBOSE:
+                        print(
+                            f"Warning: Failed to get timeline for build {build_id}: {e}",
+                            file=sys.stderr,
+                        )
+
         # Convert to new aggregation format
-        pipeline_rows = aggregate_pipelines_new_format(org_url, project_id, project_name, runs_by_pipeline)
-        
+        pipeline_rows = aggregate_pipelines_new_format(
+            org_url,
+            project_id,
+            project_name,
+            runs_by_pipeline,
+            wait_seconds_by_build_id if include_wait_time else None,
+        )
+
         # Handle jobs if requested
         job_rows = []
         if emit_jobs:
             # Ensure pools cache is populated for this org
             ensure_all_pools_loaded(org_url, auth, delay_ms)
             ensure_all_agents_loaded(org_url, auth, delay_ms)
-            
+
             for build in builds:
                 build_id = build.get("id")
                 if not build_id:
                     continue
+                timeline = timelines_by_build_id.get(build_id)
+                if timeline is None:
+                    # Either the timeline fetch failed in the loop above
+                    # (warning was logged at that point) or the build had
+                    # no id. Either way, skip job extraction for this build.
+                    continue
                 try:
-                    timeline = get_build_timeline(org_url, project_name, build_id, auth, delay_ms)
                     build_jobs = extract_job_rows_for_build(project_name, build, timeline, org_url, auth, delay_ms)
-                    
+
                     # Convert to new job format
                     for job in build_jobs:
                         job_rows.append({
@@ -986,7 +1170,7 @@ def process_project_live(
                         })
                 except Exception as e:
                     if VERBOSE:
-                        print(f"Warning: Failed to get timeline for build {build_id}: {e}", file=sys.stderr)
+                        print(f"Warning: Failed to extract jobs for build {build_id}: {e}", file=sys.stderr)
                     
         return pipeline_rows, job_rows
         
@@ -1000,7 +1184,8 @@ def process_project_mock(
     begin_dt: dt.datetime,
     end_dt: dt.datetime,
     seed: int,
-    emit_jobs: bool = False
+    emit_jobs: bool = False,
+    include_wait_time: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """T009: Process a project using deterministic mocks with threading/delay awareness"""
     project_id = project['id']
@@ -1014,11 +1199,18 @@ def process_project_mock(
     
     runs_by_pipeline = {}
     all_jobs = []
-    
+    wait_seconds_by_build_id: Dict[Any, float] = {}
+
     for pipeline in pipelines:
         runs = generate_mock_runs(pipeline, begin_dt, end_dt, seed)
         runs_by_pipeline[pipeline['id']] = runs
-        
+
+        if include_wait_time:
+            for run in runs:
+                wait_seconds_by_build_id[run['id']] = float(
+                    run.get('mock_wait_seconds', 0.0)
+                )
+
         if emit_jobs:
             for run in runs:
                 jobs = generate_mock_jobs(run, seed)
@@ -1040,7 +1232,13 @@ def process_project_mock(
                     })
     
     # Aggregate to contract format
-    pipeline_rows = aggregate_pipelines_new_format(org_url, project_id, project_name, runs_by_pipeline)
+    pipeline_rows = aggregate_pipelines_new_format(
+        org_url,
+        project_id,
+        project_name,
+        runs_by_pipeline,
+        wait_seconds_by_build_id if include_wait_time else None,
+    )
     
     return pipeline_rows, all_jobs
 
@@ -1215,7 +1413,8 @@ def main() -> None:
                             begin_dt,
                             end_dt,
                             seed,
-                            bool(args.jobs_output)
+                            bool(args.jobs_output),
+                            bool(args.include_wait_time),
                         )
                     )
                 else:
@@ -1230,7 +1429,8 @@ def main() -> None:
                             min_finish_time,
                             max_finish_time,
                             args.delay,
-                            bool(args.jobs_output)
+                            bool(args.jobs_output),
+                            bool(args.include_wait_time),
                         )
                     )
                 
