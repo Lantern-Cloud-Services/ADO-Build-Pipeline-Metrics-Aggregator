@@ -18,6 +18,38 @@ columns:
     type: integer
   - name: total_duration_seconds
     type: integer
+conditional_columns:
+  trigger: "--include-wait-breakdown"
+  description: >
+    Appended (in this order, after total_duration_seconds) when the
+    --include-wait-breakdown CLI flag is set. Computed from each build's
+    timeline records: Job records contribute to active time; records whose
+    type/name/identifier match approval/checkpoint/manualvalidation/taskcheck
+    markers contribute to approval time. wait_seconds is derived as
+    max(0, wall_clock - active_seconds) so it covers approval gates plus any
+    other idle gaps (e.g., agent acquisition between jobs). Averages divide
+    totals by wait_analyzed_run_count, not run_count, so partial coverage is
+    reported honestly when timeline fetches fail.
+  columns:
+    - name: wait_analyzed_run_count
+      type: integer
+    - name: avg_active_seconds
+      type: integer
+    - name: total_active_seconds
+      type: integer
+    - name: avg_wait_seconds
+      type: integer
+    - name: total_wait_seconds
+      type: integer
+    - name: avg_approval_seconds
+      type: integer
+    - name: total_approval_seconds
+      type: integer
 notes:
   - Deterministic column order; stable across versions.
   - Values computed from mocked runs within [begin, end) window.
+  - total_duration_seconds is wall-clock duration (finishTime - startTime)
+    and therefore INCLUDES any wait/approval time during the run.
+  - When --include-wait-breakdown is set, the appended columns satisfy
+    active + wait == total_duration (per analyzed run, modulo integer
+    rounding) and approval <= wait <= total_duration.

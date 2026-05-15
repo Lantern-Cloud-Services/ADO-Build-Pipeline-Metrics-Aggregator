@@ -208,6 +208,225 @@ def generate_mock_jobs(run: Dict[str, Any], seed: int) -> List[Dict[str, Any]]:
     
     return jobs
 
+
+# ---------------------------------------------------------------------------
+# Wait/approval time breakdown helpers (issue #1)
+#
+# These helpers classify timeline records, compute per-run breakdowns, and
+# generate deterministic mock timelines so the wait/approval differentiation
+# can be exercised in --mock mode without any network calls.
+# ---------------------------------------------------------------------------
+
+# Substring markers (lowercased) used to identify approval / manual-validation
+# / checkpoint records in the build timeline. The Azure DevOps timeline does
+# not expose a stable enum for these, so we match across type/name/identifier
+# using a fuzzy lowercased substring search.
+APPROVAL_MARKERS = ("approval", "manualvalidation", "checkpoint", "taskcheck")
+
+
+def merged_union_seconds(intervals: List[Tuple[dt.datetime, dt.datetime]]) -> float:
+    """Return the total seconds covered by the union of the given intervals.
+
+    Overlapping or touching intervals are merged so parallel jobs/stages do
+    not get double-counted.
+    """
+    valid = [(s, e) for (s, e) in intervals if s is not None and e is not None and e > s]
+    if not valid:
+        return 0.0
+
+    valid.sort(key=lambda iv: iv[0])
+    merged: List[List[dt.datetime]] = [[valid[0][0], valid[0][1]]]
+    for s, e in valid[1:]:
+        if s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1][1] = e
+        else:
+            merged.append([s, e])
+
+    return sum((e - s).total_seconds() for s, e in merged)
+
+
+def classify_timeline_record(record: Dict[str, Any]) -> str | None:
+    """Classify a timeline record as 'job', 'approval', or None.
+
+    Only records in the 'completed' state with valid start/finish timestamps
+    are classified. Approval-type waits are identified via fuzzy lowercased
+    substring match against type/name/identifier (the ADO timeline does not
+    expose a stable type enum for approvals/checks).
+    """
+    state = (record.get("state") or "").lower()
+    if state != "completed":
+        return None
+    if not record.get("startTime") or not record.get("finishTime"):
+        return None
+
+    type_val = (record.get("type") or "").lower()
+    name_val = (record.get("name") or "").lower()
+    identifier_val = (record.get("identifier") or "").lower()
+    combined = f"{type_val} {name_val} {identifier_val}"
+
+    if any(m in combined for m in APPROVAL_MARKERS):
+        return "approval"
+    if type_val == "job":
+        return "job"
+    return None
+
+
+def compute_run_wait_breakdown(
+    timeline_records: List[Dict[str, Any]],
+    wall_clock_seconds: float,
+) -> Dict[str, Any]:
+    """Compute the active/wait/approval breakdown for a single run.
+
+    Returns a dict with key 'analyzed' (bool). When True, also includes
+    'active_seconds', 'wait_seconds', 'approval_seconds' (all floats >= 0).
+
+    Identity: active + wait == wall_clock; approval <= wait <= wall_clock.
+    """
+    if wall_clock_seconds <= 0:
+        return {"analyzed": False}
+
+    job_intervals: List[Tuple[dt.datetime, dt.datetime]] = []
+    approval_intervals: List[Tuple[dt.datetime, dt.datetime]] = []
+
+    for rec in timeline_records or []:
+        cls = classify_timeline_record(rec)
+        if cls is None:
+            continue
+        try:
+            s = parse_ado_timestamp(rec["startTime"])
+            f = parse_ado_timestamp(rec["finishTime"])
+        except Exception:
+            continue
+        if s is None or f is None or f <= s:
+            continue
+        if cls == "job":
+            job_intervals.append((s, f))
+        elif cls == "approval":
+            approval_intervals.append((s, f))
+
+    if not job_intervals:
+        # No usable Job records: we cannot trust the breakdown.
+        return {"analyzed": False}
+
+    active_seconds = min(merged_union_seconds(job_intervals), wall_clock_seconds)
+    wait_seconds = max(0.0, wall_clock_seconds - active_seconds)
+    approval_seconds = min(merged_union_seconds(approval_intervals), wait_seconds)
+
+    return {
+        "analyzed": True,
+        "active_seconds": active_seconds,
+        "wait_seconds": wait_seconds,
+        "approval_seconds": approval_seconds,
+    }
+
+
+def generate_mock_timeline(run: Dict[str, Any], seed: int) -> Dict[str, Any]:
+    """Produce a deterministic mock build timeline for a run.
+
+    Roughly 40% of runs include an approval/checkpoint gate near the start;
+    the remaining time is filled by 1-3 sequential Job records. The result
+    matches the shape of the live timeline endpoint so the same
+    classification/aggregation code can consume both.
+    """
+    run_id = run["id"]
+    rng = random.Random(seed + run_id)
+
+    run_start = parse_ado_timestamp(run["startTime"])
+    run_finish = parse_ado_timestamp(run["finishTime"])
+    if run_start is None or run_finish is None or run_finish <= run_start:
+        return {"records": []}
+
+    wall = (run_finish - run_start).total_seconds()
+    records: List[Dict[str, Any]] = []
+    next_record_id = 1
+
+    has_approval = rng.random() < 0.4
+    if has_approval and wall > 60:
+        # Approval gate consumes between 1 minute and 40% of wall-clock time.
+        max_approval = max(60.0, wall * 0.4)
+        approval_duration = rng.uniform(60.0, max_approval)
+        approval_start_offset = rng.uniform(0.0, min(30.0, wall * 0.05))
+        approval_start = run_start + dt.timedelta(seconds=approval_start_offset)
+        approval_finish = approval_start + dt.timedelta(seconds=approval_duration)
+        if approval_finish >= run_finish:
+            approval_finish = run_finish - dt.timedelta(seconds=1)
+        records.append({
+            "id": f"mock-{run_id}-{next_record_id}",
+            "type": "Checkpoint",
+            "name": "Approval Gate",
+            "identifier": "Checkpoint.Approval",
+            "state": "completed",
+            "result": "succeeded",
+            "startTime": approval_start.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+            "finishTime": approval_finish.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+        })
+        next_record_id += 1
+        job_start = approval_finish
+    else:
+        job_start = run_start
+
+    remaining = (run_finish - job_start).total_seconds()
+    if remaining > 0:
+        job_count = rng.randint(1, 3)
+        per_job = remaining / job_count
+        current = job_start
+        for i in range(job_count):
+            job_finish = current + dt.timedelta(seconds=per_job)
+            if i == job_count - 1:
+                job_finish = run_finish
+            records.append({
+                "id": f"mock-{run_id}-{next_record_id}",
+                "type": "Job",
+                "name": f"Job-{i+1}",
+                "identifier": f"job_{i+1}",
+                "state": "completed",
+                "result": run.get("result", "succeeded"),
+                "startTime": current.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+                "finishTime": job_finish.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+                "workerName": f"Agent-{rng.randint(1, 5)}",
+            })
+            next_record_id += 1
+            current = job_finish
+
+    return {"records": records}
+
+
+def aggregate_wait_breakdown(per_run_breakdowns: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Aggregate a list of per-run breakdown dicts into per-pipeline totals.
+
+    Only runs with analyzed=True contribute to active/wait/approval sums and
+    averages. Averages are computed against wait_analyzed_run_count so partial
+    coverage is honestly reflected.
+    """
+    analyzed = [b for b in per_run_breakdowns if b and b.get("analyzed")]
+    n = len(analyzed)
+    total_active = sum(b["active_seconds"] for b in analyzed)
+    total_wait = sum(b["wait_seconds"] for b in analyzed)
+    total_approval = sum(b["approval_seconds"] for b in analyzed)
+    return {
+        "wait_analyzed_run_count": n,
+        "avg_active_seconds": int(total_active / n) if n > 0 else 0,
+        "total_active_seconds": int(total_active),
+        "avg_wait_seconds": int(total_wait / n) if n > 0 else 0,
+        "total_wait_seconds": int(total_wait),
+        "avg_approval_seconds": int(total_approval / n) if n > 0 else 0,
+        "total_approval_seconds": int(total_approval),
+    }
+
+
+# Field names appended to pipeline CSV rows when --include-wait-breakdown is set.
+WAIT_BREAKDOWN_FIELDS = (
+    "wait_analyzed_run_count",
+    "avg_active_seconds",
+    "total_active_seconds",
+    "avg_wait_seconds",
+    "total_wait_seconds",
+    "avg_approval_seconds",
+    "total_approval_seconds",
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -290,6 +509,19 @@ def parse_args() -> argparse.Namespace:
         "--mock",
         action="store_true",
         help="Use deterministic mock data instead of live Azure DevOps API (for testing)",
+    )
+
+    parser.add_argument(
+        "--include-wait-breakdown",
+        action="store_true",
+        help=(
+            "Fetch build timelines to differentiate wait/approval time from active "
+            "execution time. Appends 7 columns to the pipeline CSV "
+            "(wait_analyzed_run_count, avg/total active/wait/approval seconds) and "
+            "adds a 'Wait Time Analysis' section to the summary markdown. When "
+            "--jobs_output is also set, the already-fetched timeline is reused (no "
+            "extra API calls). Default: off (output schema unchanged)."
+        ),
     )
 
     return parser.parse_args()
@@ -687,9 +919,16 @@ def aggregate_pipelines_new_format(
     org_url: str,
     project_id: str,
     project_name: str,
-    runs_by_pipeline: Dict[int, List[Dict[str, Any]]]
+    runs_by_pipeline: Dict[int, List[Dict[str, Any]]],
+    breakdowns_by_pipeline: Dict[int, List[Dict[str, Any]]] | None = None,
 ) -> List[Dict[str, Any]]:
-    """Aggregate pipeline runs into new CSV format following pipeline_aggregate.csv.schema.yaml"""
+    """Aggregate pipeline runs into new CSV format following pipeline_aggregate.csv.schema.yaml
+
+    When ``breakdowns_by_pipeline`` is provided (one list of per-run breakdown
+    dicts per pipeline_id, in any order), each result row is enriched with the
+    seven WAIT_BREAKDOWN_FIELDS so the wait/approval differentiation can be
+    written to the CSV and rolled up in the summary.
+    """
     results = []
     
     for pipeline_id, runs in runs_by_pipeline.items():
@@ -710,7 +949,7 @@ def aggregate_pipelines_new_format(
         
         avg_duration_seconds = int(total_duration_seconds / run_count) if run_count > 0 else 0
         
-        results.append({
+        row = {
             'org_url': org_url,
             'project_id': project_id,
             'project_name': project_name,
@@ -719,12 +958,28 @@ def aggregate_pipelines_new_format(
             'run_count': run_count,
             'avg_duration_seconds': avg_duration_seconds,
             'total_duration_seconds': int(total_duration_seconds)
-        })
+        }
+
+        if breakdowns_by_pipeline is not None:
+            row.update(aggregate_wait_breakdown(
+                breakdowns_by_pipeline.get(pipeline_id, [])
+            ))
+
+        results.append(row)
     
     return results
 
-def write_pipeline_csv(file_handle: Any, pipeline_rows: List[Dict[str, Any]]) -> None:
-    """T006: Write pipeline CSV following contracts/pipeline_aggregate.csv.schema.yaml"""
+def write_pipeline_csv(
+    file_handle: Any,
+    pipeline_rows: List[Dict[str, Any]],
+    include_wait_breakdown: bool = False,
+) -> None:
+    """T006: Write pipeline CSV following contracts/pipeline_aggregate.csv.schema.yaml
+
+    When ``include_wait_breakdown`` is True, the seven WAIT_BREAKDOWN_FIELDS are
+    appended to the header in deterministic order. When False, the legacy
+    8-column schema is preserved bit-for-bit.
+    """
     fieldnames = [
         'org_url',
         'project_id', 
@@ -735,8 +990,10 @@ def write_pipeline_csv(file_handle: Any, pipeline_rows: List[Dict[str, Any]]) ->
         'avg_duration_seconds',
         'total_duration_seconds'
     ]
+    if include_wait_breakdown:
+        fieldnames.extend(WAIT_BREAKDOWN_FIELDS)
     
-    writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
+    writer = csv.DictWriter(file_handle, fieldnames=fieldnames, extrasaction='ignore')
     writer.writeheader()
     
     for row in pipeline_rows:
@@ -769,8 +1026,17 @@ def write_jobs_csv(file_handle: Any, job_rows: List[Dict[str, Any]]) -> None:
     for row in job_rows:
         writer.writerow(row)
 
-def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) -> None:
-    """T007: Write human-readable summary following contracts/summary.md.schema.yaml"""
+def write_summary_markdown(
+    file_path: str,
+    pipeline_rows: List[Dict[str, Any]],
+    include_wait_breakdown: bool = False,
+) -> None:
+    """T007: Write human-readable summary following contracts/summary.md.schema.yaml
+
+    When ``include_wait_breakdown`` is True and at least one row has a
+    non-zero ``wait_analyzed_run_count``, additional bullets and a "Top
+    Pipelines by Wait %" table are appended.
+    """
     if not pipeline_rows:
         return
     
@@ -782,10 +1048,33 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
     org_count = len(set(row['org_url'] for row in pipeline_rows))
     project_count = len(set(f"{row['org_url']}|{row['project_id']}" for row in pipeline_rows))
     pipeline_count = len(pipeline_rows)
-    
+
+    # Wait-breakdown rollups (only meaningful when flag set)
+    show_waits = include_wait_breakdown and any(
+        row.get('wait_analyzed_run_count', 0) > 0 for row in pipeline_rows
+    )
+
+    def _wait_rollup(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+        analyzed = sum(r.get('wait_analyzed_run_count', 0) for r in rows)
+        active = sum(r.get('total_active_seconds', 0) for r in rows)
+        wait = sum(r.get('total_wait_seconds', 0) for r in rows)
+        approval = sum(r.get('total_approval_seconds', 0) for r in rows)
+        return {
+            'analyzed': analyzed,
+            'total_active': active,
+            'total_wait': wait,
+            'total_approval': approval,
+            'avg_active': int(active / analyzed) if analyzed > 0 else 0,
+            'avg_wait': int(wait / analyzed) if analyzed > 0 else 0,
+            'avg_approval': int(approval / analyzed) if analyzed > 0 else 0,
+        }
+
+    def _wait_pct(wait: int, total: int) -> float:
+        return (wait / total * 100.0) if total > 0 else 0.0
+
     # Group by org and project for detailed sections
-    by_org = {}
-    by_project = {}
+    by_org: Dict[str, Dict[str, Any]] = {}
+    by_project: Dict[str, Dict[str, Any]] = {}
     
     for row in pipeline_rows:
         org_url = row['org_url']
@@ -820,7 +1109,16 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
         f.write(f"- **Pipelines**: {pipeline_count}\n")
         f.write(f"- **Total Runs**: {total_runs}\n")
         f.write(f"- **Total Duration**: {total_duration_seconds:,} seconds ({seconds_to_hms(total_duration_seconds)})\n")
-        f.write(f"- **Average Duration**: {avg_duration_seconds} seconds ({seconds_to_hms(avg_duration_seconds)})\n\n")
+        f.write(f"- **Average Duration**: {avg_duration_seconds} seconds ({seconds_to_hms(avg_duration_seconds)})\n")
+        if show_waits:
+            roll = _wait_rollup(pipeline_rows)
+            pct = _wait_pct(roll['total_wait'], total_duration_seconds)
+            f.write(f"- **Wait Breakdown Analyzed Runs**: {roll['analyzed']} / {total_runs}\n")
+            f.write(f"- **Total Active Time**: {roll['total_active']:,} seconds ({seconds_to_hms(roll['total_active'])})\n")
+            f.write(f"- **Total Wait Time**: {roll['total_wait']:,} seconds ({seconds_to_hms(roll['total_wait'])}) ({pct:.1f}% of duration)\n")
+            f.write(f"- **Total Approval Time**: {roll['total_approval']:,} seconds ({seconds_to_hms(roll['total_approval'])})\n")
+            f.write(f"- **Average Wait Time**: {roll['avg_wait']} seconds ({seconds_to_hms(roll['avg_wait'])})\n")
+        f.write("\n")
         
         # By Organization section
         f.write("## By Organization\n\n")
@@ -832,7 +1130,15 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
             f.write(f"- **Pipelines**: {org_pipeline_count}\n")
             f.write(f"- **Total Runs**: {data['total_runs']}\n")
             f.write(f"- **Total Duration**: {data['total_duration']:,} seconds ({seconds_to_hms(data['total_duration'])})\n")
-            f.write(f"- **Average Duration**: {org_avg_duration} seconds ({seconds_to_hms(org_avg_duration)})\n\n")
+            f.write(f"- **Average Duration**: {org_avg_duration} seconds ({seconds_to_hms(org_avg_duration)})\n")
+            if show_waits:
+                org_roll = _wait_rollup(data['pipelines'])
+                if org_roll['analyzed'] > 0:
+                    pct = _wait_pct(org_roll['total_wait'], data['total_duration'])
+                    f.write(f"- **Wait Breakdown Analyzed Runs**: {org_roll['analyzed']} / {data['total_runs']}\n")
+                    f.write(f"- **Total Wait Time**: {org_roll['total_wait']:,} seconds ({seconds_to_hms(org_roll['total_wait'])}) ({pct:.1f}% of duration)\n")
+                    f.write(f"- **Total Approval Time**: {org_roll['total_approval']:,} seconds ({seconds_to_hms(org_roll['total_approval'])})\n")
+            f.write("\n")
         
         # By Project section  
         f.write("## By Project\n\n")
@@ -843,7 +1149,51 @@ def write_summary_markdown(file_path: str, pipeline_rows: List[Dict[str, Any]]) 
             f.write(f"### {data['project_name']} ({data['org_url']})\n\n")
             f.write(f"- **Pipelines**: {project_pipeline_count}\n")
             f.write(f"- **Total Runs**: {data['total_runs']}\n")
-            f.write(f"- **Total Duration**: {data['total_duration']:,} seconds ({seconds_to_hms(data['total_duration'])})\n\n")
+            f.write(f"- **Total Duration**: {data['total_duration']:,} seconds ({seconds_to_hms(data['total_duration'])})\n")
+            if show_waits:
+                proj_roll = _wait_rollup(data['pipelines'])
+                if proj_roll['analyzed'] > 0:
+                    pct = _wait_pct(proj_roll['total_wait'], data['total_duration'])
+                    f.write(f"- **Wait Breakdown Analyzed Runs**: {proj_roll['analyzed']} / {data['total_runs']}\n")
+                    f.write(f"- **Total Wait Time**: {proj_roll['total_wait']:,} seconds ({seconds_to_hms(proj_roll['total_wait'])}) ({pct:.1f}% of duration)\n")
+                    f.write(f"- **Total Approval Time**: {proj_roll['total_approval']:,} seconds ({seconds_to_hms(proj_roll['total_approval'])})\n")
+            f.write("\n")
+
+        # Wait Time Analysis section
+        if show_waits:
+            f.write("## Wait Time Analysis\n\n")
+            f.write(
+                "Wait time is the portion of a run's wall-clock duration where no "
+                "Job was actively executing (e.g., waiting on a manual approval "
+                "gate, environment check, or stage dependency). Approval time is "
+                "the subset of wait time spent in approval/checkpoint records. "
+                "Identity: `active_seconds + wait_seconds = total_duration_seconds`; "
+                "`approval_seconds <= wait_seconds`.\n\n"
+            )
+            f.write("### Top Pipelines by Wait %\n\n")
+            f.write("| Pipeline | Project | Org | Runs Analyzed | Wait % | Avg Wait | Avg Approval |\n")
+            f.write("|----------|---------|-----|---------------|--------|----------|---------------|\n")
+
+            ranked = []
+            for row in pipeline_rows:
+                analyzed = row.get('wait_analyzed_run_count', 0)
+                if analyzed <= 0:
+                    continue
+                row_total = row.get('total_duration_seconds', 0) or 0
+                pct = _wait_pct(row.get('total_wait_seconds', 0), row_total)
+                ranked.append((pct, row, analyzed))
+
+            ranked.sort(key=lambda t: t[0], reverse=True)
+            for pct, row, analyzed in ranked[:10]:
+                avg_wait = row.get('avg_wait_seconds', 0)
+                avg_approval = row.get('avg_approval_seconds', 0)
+                f.write(
+                    f"| {row['pipeline_name']} | {row['project_name']} | {row['org_url']} "
+                    f"| {analyzed} / {row['run_count']} | {pct:.1f}% "
+                    f"| {avg_wait}s ({seconds_to_hms(avg_wait)}) "
+                    f"| {avg_approval}s ({seconds_to_hms(avg_approval)}) |\n"
+                )
+            f.write("\n")
 
 def aggregate_builds_for_project(
     project_name: str,
@@ -929,6 +1279,7 @@ def process_project_live(
     max_finish_time: str,
     delay_ms: int,
     emit_jobs: bool,
+    include_wait_breakdown: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Process a project using live Azure DevOps API calls"""
     project_name = proj["name"]
@@ -952,42 +1303,81 @@ def process_project_live(
                 if pipeline_id not in runs_by_pipeline:
                     runs_by_pipeline[pipeline_id] = []
                 runs_by_pipeline[pipeline_id].append(build)
-        
-        # Convert to new aggregation format
-        pipeline_rows = aggregate_pipelines_new_format(org_url, project_id, project_name, runs_by_pipeline)
-        
-        # Handle jobs if requested
+
+        # Determine whether timelines need to be fetched at all
+        need_timelines = emit_jobs or include_wait_breakdown
+        breakdowns_by_pipeline: Dict[int, List[Dict[str, Any]]] | None = (
+            {} if include_wait_breakdown else None
+        )
+        timeline_by_build: Dict[int, Dict[str, Any]] = {}
+
+        # Handle jobs/timelines if requested
         job_rows = []
-        if emit_jobs:
-            # Ensure pools cache is populated for this org
-            ensure_all_pools_loaded(org_url, auth, delay_ms)
-            ensure_all_agents_loaded(org_url, auth, delay_ms)
-            
+        if need_timelines:
+            if emit_jobs:
+                # Ensure pools cache is populated for this org
+                ensure_all_pools_loaded(org_url, auth, delay_ms)
+                ensure_all_agents_loaded(org_url, auth, delay_ms)
+
             for build in builds:
                 build_id = build.get("id")
                 if not build_id:
                     continue
                 try:
                     timeline = get_build_timeline(org_url, project_name, build_id, auth, delay_ms)
-                    build_jobs = extract_job_rows_for_build(project_name, build, timeline, org_url, auth, delay_ms)
-                    
-                    # Convert to new job format
-                    for job in build_jobs:
-                        job_rows.append({
-                            'org_url': org_url,
-                            'project_id': project_id,
-                            'pipeline_id': job.get('pipeline_id'),
-                            'run_id': build_id,
-                            'job_id': f"{build_id}_{job.get('job_name', 'unknown')}",
-                            'job_name': job.get('job_name'),
-                            'duration_seconds': int(job.get('job_duration_seconds', 0)),
-                            'pool_id': job.get('pool_id'),
-                            'pool_name': job.get('pool_name')
-                        })
                 except Exception as e:
                     if VERBOSE:
                         print(f"Warning: Failed to get timeline for build {build_id}: {e}", file=sys.stderr)
-                    
+                    continue
+
+                timeline_by_build[build_id] = timeline
+
+                if emit_jobs:
+                    try:
+                        build_jobs = extract_job_rows_for_build(project_name, build, timeline, org_url, auth, delay_ms)
+                        # Convert to new job format
+                        for job in build_jobs:
+                            job_rows.append({
+                                'org_url': org_url,
+                                'project_id': project_id,
+                                'pipeline_id': job.get('pipeline_id'),
+                                'run_id': build_id,
+                                'job_id': f"{build_id}_{job.get('job_name', 'unknown')}",
+                                'job_name': job.get('job_name'),
+                                'duration_seconds': int(job.get('job_duration_seconds', 0)),
+                                'pool_id': job.get('pool_id'),
+                                'pool_name': job.get('pool_name')
+                            })
+                    except Exception as e:
+                        if VERBOSE:
+                            print(f"Warning: Failed to extract jobs for build {build_id}: {e}", file=sys.stderr)
+
+        # Compute per-run wait breakdowns from the (already fetched) timelines
+        if include_wait_breakdown:
+            for pipeline_id, runs in runs_by_pipeline.items():
+                bucket: List[Dict[str, Any]] = []
+                for build in runs:
+                    build_id = build.get("id")
+                    timeline = timeline_by_build.get(build_id)
+                    if timeline is None:
+                        # Timeline fetch failed for this run; skip from breakdown
+                        # totals to avoid lying. The run still counts in run_count
+                        # and total_duration_seconds.
+                        continue
+                    wall = parse_duration_seconds(
+                        build.get('startTime'), build.get('finishTime')
+                    )
+                    bd = compute_run_wait_breakdown(timeline.get('records', []), wall)
+                    if bd.get('analyzed'):
+                        bucket.append(bd)
+                breakdowns_by_pipeline[pipeline_id] = bucket
+
+        # Convert to new aggregation format (with wait breakdown when requested)
+        pipeline_rows = aggregate_pipelines_new_format(
+            org_url, project_id, project_name, runs_by_pipeline,
+            breakdowns_by_pipeline=breakdowns_by_pipeline,
+        )
+
         return pipeline_rows, job_rows
         
     except Exception as e:
@@ -1000,7 +1390,8 @@ def process_project_mock(
     begin_dt: dt.datetime,
     end_dt: dt.datetime,
     seed: int,
-    emit_jobs: bool = False
+    emit_jobs: bool = False,
+    include_wait_breakdown: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """T009: Process a project using deterministic mocks with threading/delay awareness"""
     project_id = project['id']
@@ -1014,10 +1405,23 @@ def process_project_mock(
     
     runs_by_pipeline = {}
     all_jobs = []
+    breakdowns_by_pipeline: Dict[int, List[Dict[str, Any]]] | None = (
+        {} if include_wait_breakdown else None
+    )
     
     for pipeline in pipelines:
         runs = generate_mock_runs(pipeline, begin_dt, end_dt, seed)
         runs_by_pipeline[pipeline['id']] = runs
+
+        if include_wait_breakdown:
+            bucket: List[Dict[str, Any]] = []
+            for run in runs:
+                timeline = generate_mock_timeline(run, seed)
+                wall = parse_duration_seconds(run.get('startTime'), run.get('finishTime'))
+                bd = compute_run_wait_breakdown(timeline.get('records', []), wall)
+                if bd.get('analyzed'):
+                    bucket.append(bd)
+            breakdowns_by_pipeline[pipeline['id']] = bucket
         
         if emit_jobs:
             for run in runs:
@@ -1040,7 +1444,10 @@ def process_project_mock(
                     })
     
     # Aggregate to contract format
-    pipeline_rows = aggregate_pipelines_new_format(org_url, project_id, project_name, runs_by_pipeline)
+    pipeline_rows = aggregate_pipelines_new_format(
+        org_url, project_id, project_name, runs_by_pipeline,
+        breakdowns_by_pipeline=breakdowns_by_pipeline,
+    )
     
     return pipeline_rows, all_jobs
 
@@ -1215,7 +1622,8 @@ def main() -> None:
                             begin_dt,
                             end_dt,
                             seed,
-                            bool(args.jobs_output)
+                            bool(args.jobs_output),
+                            bool(args.include_wait_breakdown),
                         )
                     )
                 else:
@@ -1230,7 +1638,8 @@ def main() -> None:
                             min_finish_time,
                             max_finish_time,
                             args.delay,
-                            bool(args.jobs_output)
+                            bool(args.jobs_output),
+                            bool(args.include_wait_breakdown),
                         )
                     )
                 
@@ -1253,10 +1662,10 @@ def main() -> None:
     # Write pipeline CSV output
     if args.output:
         with open(args.output, 'w', newline='', encoding='utf-8') as f:
-            write_pipeline_csv(f, all_pipeline_rows)
+            write_pipeline_csv(f, all_pipeline_rows, include_wait_breakdown=bool(args.include_wait_breakdown))
             print(f"Pipeline CSV written to: {args.output}", file=sys.stderr)
     else:
-        write_pipeline_csv(sys.stdout, all_pipeline_rows)
+        write_pipeline_csv(sys.stdout, all_pipeline_rows, include_wait_breakdown=bool(args.include_wait_breakdown))
 
     # Write jobs CSV if requested
     if args.jobs_output and all_job_rows:
@@ -1266,7 +1675,7 @@ def main() -> None:
 
     # Write summary if path determined
     if summary_path and all_pipeline_rows:
-        write_summary_markdown(summary_path, all_pipeline_rows)
+        write_summary_markdown(summary_path, all_pipeline_rows, include_wait_breakdown=bool(args.include_wait_breakdown))
         print(f"Summary written to: {summary_path}", file=sys.stderr)
     elif not summary_path and all_pipeline_rows:
         print("INFO: No summary output path specified. Use --summary_output to generate human-readable summary.", file=sys.stderr)
